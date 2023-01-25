@@ -1,10 +1,12 @@
 """PGSync QueryBuilder."""
-from typing import Dict, List
+from collections import defaultdict
+from typing import Dict, List, Optional
 
 import sqlalchemy as sa
 
-from .base import compiled_query, get_foreign_keys
+from .base import compiled_query, TupleIdentifierType
 from .constants import OBJECT, ONE_TO_MANY, ONE_TO_ONE, SCALAR
+from .exc import ForeignKeyError
 from .node import Node
 
 
@@ -15,6 +17,30 @@ class QueryBuilder(object):
         """Query builder constructor."""
         self.verbose: bool = verbose
         self.isouter: bool = True
+        self._cache: dict = {}
+
+    def _build_filters(
+        self, filters: Dict[str, List[dict]], node: Node
+    ) -> sa.sql.elements.BooleanClauseList:
+        """
+        Build SQLAlchemy filters.
+
+        NB:
+        assumption dictionary is an AND and list is an OR
+
+        filters['book'] = [
+            {'id': 1, 'uid': '001'},
+            {'id': 2, 'uid': '002'}
+        ]
+        """
+        if filters.get(node.table):
+            _filters: list = []
+            for _filter in filters.get(node.table):
+                where: list = []
+                for key, value in _filter.items():
+                    where.append(node.model.c[key] == value)
+                _filters.append(sa.and_(*where))
+            return sa.or_(*_filters)
 
     def _json_build_object(
         self, columns: list, chunk_size: int = 100
@@ -51,38 +77,104 @@ class QueryBuilder(object):
 
         return expression
 
+    # this is for handling non-through tables
+    def get_foreign_keys(self, node_a: Node, node_b: Node) -> dict:
+        if (node_a, node_b) not in self._cache:
+
+            foreign_keys: dict = {}
+            # if either offers a foreign_key via relationship, use it!
+            if (
+                node_a.relationship.foreign_key.parent
+                or node_b.relationship.foreign_key.parent
+            ):
+                if node_a.relationship.foreign_key.parent:
+                    foreign_keys[node_a.parent.name] = sorted(
+                        node_a.relationship.foreign_key.parent
+                    )
+                    foreign_keys[node_a.name] = sorted(
+                        node_a.relationship.foreign_key.child
+                    )
+                if node_b.relationship.foreign_key.parent:
+                    foreign_keys[node_b.parent.name] = sorted(
+                        node_b.relationship.foreign_key.parent
+                    )
+                    foreign_keys[node_b.name] = sorted(
+                        node_b.relationship.foreign_key.child
+                    )
+
+            else:
+                fkeys: dict = defaultdict(list)
+                if node_a.model.foreign_keys:
+                    for key in node_a.model.original.foreign_keys:
+                        if key._table_key() == str(node_b.model.original):
+                            fkeys[
+                                f"{key.parent.table.schema}."
+                                f"{key.parent.table.name}"
+                            ].append(str(key.parent.name))
+                            fkeys[
+                                f"{key.column.table.schema}."
+                                f"{key.column.table.name}"
+                            ].append(str(key.column.name))
+                if not fkeys:
+                    if node_b.model.original.foreign_keys:
+                        for key in node_b.model.original.foreign_keys:
+                            if key._table_key() == str(node_a.model.original):
+                                fkeys[
+                                    f"{key.parent.table.schema}."
+                                    f"{key.parent.table.name}"
+                                ].append(str(key.parent.name))
+                                fkeys[
+                                    f"{key.column.table.schema}."
+                                    f"{key.column.table.name}"
+                                ].append(str(key.column.name))
+                if not fkeys:
+                    raise ForeignKeyError(
+                        f"No foreign key relationship between "
+                        f"{node_a.model.original} and {node_b.model.original}"
+                    )
+
+                for table, columns in fkeys.items():
+                    foreign_keys[table] = columns
+
+            self._cache[(node_a, node_b)] = foreign_keys
+
+        return self._cache[(node_a, node_b)]
+
     def _get_foreign_keys(self, node_a: Node, node_b: Node) -> Dict:
-        if (
-            node_a.relationship.through_nodes
-            or node_b.relationship.through_nodes
-        ):
+        """This is for handling through nodes."""
+        if (node_a, node_b) not in self._cache:
+            if node_a.relationship.throughs or node_b.relationship.throughs:
 
-            if node_a.relationship.through_nodes:
-                through_node: Node = node_a.relationship.through_nodes[0]
+                if node_a.relationship.throughs:
+                    through: Node = node_a.relationship.throughs[0]
 
-            if node_b.relationship.through_nodes:
-                through_node: Node = node_b.relationship.through_nodes[0]
-                node_a, node_b = node_b, node_a
+                if node_b.relationship.throughs:
+                    through: Node = node_b.relationship.throughs[0]
+                    node_a, node_b = node_b, node_a
 
-            foreign_keys: dict = get_foreign_keys(node_a, through_node)
-            for key, value in get_foreign_keys(through_node, node_b).items():
-                if key in foreign_keys:
-                    foreign_keys[key].extend(value)
-                    continue
-                foreign_keys[key] = value
+                foreign_keys: dict = self.get_foreign_keys(node_a, through)
+                for key, values in self.get_foreign_keys(
+                    through, node_b
+                ).items():
+                    if key in foreign_keys:
+                        for value in values:
+                            if value not in foreign_keys[key]:
+                                foreign_keys[key].append(value)
+                        continue
+                    foreign_keys[key] = values
+            else:
+                foreign_keys = self.get_foreign_keys(node_a, node_b)
 
-            return foreign_keys
+            self._cache[(node_a, node_b)] = foreign_keys
 
-        else:
-
-            return get_foreign_keys(node_a, node_b)
+        return self._cache[(node_a, node_b)]
 
     def _get_column_foreign_keys(
         self,
-        columns,
-        foreign_keys,
-        table=None,
-        schema=None,
+        columns: List[str],
+        foreign_keys: dict,
+        table: str = None,
+        schema: str = None,
     ):
         """
         Get the foreign keys where the columns are provided.
@@ -98,9 +190,9 @@ class QueryBuilder(object):
         """
         # TODO: normalize this elsewhere
         try:
-            column_names: List = [column.name for column in columns]
+            column_names: List[str] = [column.name for column in columns]
         except AttributeError:
-            column_names: List = [column for column in columns]
+            column_names: List[str] = [column for column in columns]
 
         if table is None:
             for table, cols in foreign_keys.items():
@@ -125,7 +217,7 @@ class QueryBuilder(object):
         )
         for child in node.children:
             if (
-                not child.parent.relationship.through_nodes
+                not child.parent.relationship.throughs
                 and child.parent.relationship.type == ONE_TO_MANY
             ):
                 row = row.concat(
@@ -143,7 +235,13 @@ class QueryBuilder(object):
                 )
         return row.label("_keys")
 
-    def _root(self, node) -> None:
+    def _root(
+        self,
+        node: Node,
+        txmin: Optional[int] = None,
+        txmax: Optional[int] = None,
+        ctid: Optional[dict] = None,
+    ) -> None:
         columns = [
             sa.func.JSON_BUILD_ARRAY(
                 *[
@@ -163,6 +261,61 @@ class QueryBuilder(object):
         if self.from_obj is not None:
             node._subquery = node._subquery.select_from(self.from_obj)
 
+        if ctid is not None:
+            subquery = []
+            for page, rows in ctid.items():
+                subquery.append(
+                    sa.select(
+                        [
+                            sa.cast(
+                                sa.literal_column(f"'({page},'")
+                                .concat(sa.column("s"))
+                                .concat(")"),
+                                TupleIdentifierType,
+                            )
+                        ]
+                    ).select_from(
+                        sa.sql.Values(
+                            sa.column("s"),
+                        )
+                        .data([(row,) for row in rows])
+                        .alias("s")
+                    )
+                )
+            if subquery:
+                node._filters.append(
+                    sa.or_(
+                        *[
+                            node.model.c.ctid
+                            == sa.any_(sa.func.ARRAY(q.scalar_subquery()))
+                            for q in subquery
+                        ]
+                    )
+                )
+
+        if txmin:
+            node._filters.append(
+                sa.cast(
+                    sa.cast(
+                        node.model.c.xmin,
+                        sa.Text,
+                    ),
+                    sa.BigInteger,
+                )
+                >= txmin
+            )
+        if txmax:
+            node._filters.append(
+                sa.cast(
+                    sa.cast(
+                        node.model.c.xmin,
+                        sa.Text,
+                    ),
+                    sa.BigInteger,
+                )
+                < txmax
+            )
+
         if node._filters:
             node._subquery = node._subquery.where(sa.and_(*node._filters))
         node._subquery = node._subquery.alias()
@@ -176,7 +329,7 @@ class QueryBuilder(object):
 
             onclause: List = []
 
-            if child.relationship.through_nodes:
+            if child.relationship.throughs:
 
                 child.parent.columns.extend(
                     [
@@ -185,15 +338,15 @@ class QueryBuilder(object):
                     ]
                 )
 
-                through_node: Node = child.relationship.through_nodes[0]
-                foreign_keys: dict = get_foreign_keys(
-                    child.parent, through_node
+                through: Node = child.relationship.throughs[0]
+                foreign_keys: dict = self.get_foreign_keys(
+                    child.parent, through
                 )
 
                 left_foreign_keys = self._get_column_foreign_keys(
                     child._subquery.columns,
                     foreign_keys,
-                    table=through_node.name,
+                    table=through.name,
                     schema=child.schema,
                 )
                 right_foreign_keys = self._get_column_foreign_keys(
@@ -216,7 +369,7 @@ class QueryBuilder(object):
                     ]
                 )
 
-                foreign_keys: dict = get_foreign_keys(node, child)
+                foreign_keys: dict = self.get_foreign_keys(node, child)
                 left_foreign_keys: dict = self._get_column_foreign_keys(
                     child._subquery.columns,
                     foreign_keys,
@@ -284,14 +437,16 @@ class QueryBuilder(object):
 
     def _through(self, node: Node) -> None:  # noqa: C901
 
-        through_node: Node = node.relationship.through_nodes[0]
-        foreign_keys: dict = get_foreign_keys(node, through_node)
+        through: Node = node.relationship.throughs[0]
+        foreign_keys: dict = self.get_foreign_keys(node, through)
 
-        for key, value in get_foreign_keys(through_node, node.parent).items():
+        for key, values in self.get_foreign_keys(through, node.parent).items():
             if key in foreign_keys:
-                foreign_keys[key].extend(value)
+                for value in values:
+                    if value not in foreign_keys[key]:
+                        foreign_keys[key].append(value)
                 continue
-            foreign_keys[key] = value
+            foreign_keys[key] = values
 
         foreign_key_columns = self._get_column_foreign_keys(
             node.model.columns,
@@ -350,20 +505,22 @@ class QueryBuilder(object):
 
             onclause = []
 
-            if child.relationship.through_nodes:
+            if child.relationship.throughs:
 
-                child_through: Node = child.relationship.through_nodes[0]
-                child_foreign_keys: dict = get_foreign_keys(
+                child_through: Node = child.relationship.throughs[0]
+                child_foreign_keys: dict = self.get_foreign_keys(
                     child, child_through
                 )
-                for key, value in get_foreign_keys(
+                for key, values in self.get_foreign_keys(
                     child_through,
                     child.parent,
                 ).items():
                     if key in child_foreign_keys:
-                        child_foreign_keys[key].extend(value)
+                        for value in values:
+                            if value not in child_foreign_keys[key]:
+                                child_foreign_keys[key].append(value)
                         continue
-                    child_foreign_keys[key] = value
+                    child_foreign_keys[key] = values
 
                 left_foreign_keys = self._get_column_foreign_keys(
                     child._subquery.columns,
@@ -374,7 +531,7 @@ class QueryBuilder(object):
 
             else:
 
-                child_foreign_keys: dict = get_foreign_keys(
+                child_foreign_keys: dict = self.get_foreign_keys(
                     child.parent, child
                 )
                 left_foreign_keys: dict = self._get_column_foreign_keys(
@@ -438,7 +595,7 @@ class QueryBuilder(object):
         outer_subquery = sa.select(columns)
 
         parent_foreign_key_columns = self._get_column_foreign_keys(
-            through_node.columns,
+            through.columns,
             foreign_keys,
             schema=node.schema,
         )
@@ -446,7 +603,7 @@ class QueryBuilder(object):
         for i in range(len(foreign_key_columns)):
             where.append(
                 node.model.c[foreign_key_columns[i]]
-                == through_node.model.c[parent_foreign_key_columns[i]]
+                == through.model.c[parent_foreign_key_columns[i]]
             )
         outer_subquery = outer_subquery.where(sa.and_(*where))
 
@@ -462,19 +619,17 @@ class QueryBuilder(object):
             compiled_query(outer_subquery, "Outer subquery")
 
         params = []
-        for primary_key in through_node.model.primary_keys:
+        for primary_key in through.model.primary_keys:
             params.append(
                 sa.func.JSON_BUILD_OBJECT(
                     str(primary_key),
-                    sa.func.JSON_BUILD_ARRAY(
-                        through_node.model.c[primary_key]
-                    ),
+                    sa.func.JSON_BUILD_ARRAY(through.model.c[primary_key]),
                 )
             )
 
         through_keys = sa.cast(
             sa.func.JSON_BUILD_OBJECT(
-                node.relationship.through_nodes[0].table,
+                node.relationship.throughs[0].table,
                 sa.func.JSON_BUILD_ARRAY(*params),
             ),
             sa.dialects.postgresql.JSONB,
@@ -490,9 +645,9 @@ class QueryBuilder(object):
 
         left_foreign_keys = foreign_keys[node.name]
         right_foreign_keys = self._get_column_foreign_keys(
-            through_node.columns,
+            through.columns,
             foreign_keys,
-            table=through_node.table,
+            table=through.table,
             schema=node.schema,
         )
 
@@ -501,10 +656,10 @@ class QueryBuilder(object):
             sa.func.JSON_AGG(outer_subquery.c.anon).label(node.label),
         ]
 
-        foreign_keys: dict = get_foreign_keys(node.parent, through_node)
+        foreign_keys: dict = self.get_foreign_keys(node.parent, through)
 
-        for column in foreign_keys[through_node.name]:
-            columns.append(through_node.model.c[column])
+        for column in foreign_keys[through.name]:
+            columns.append(through.model.c[str(column)])
 
         inner_subquery = sa.select(columns)
 
@@ -515,7 +670,7 @@ class QueryBuilder(object):
         for i in range(len(left_foreign_keys)):
             onclause.append(
                 outer_subquery.c[left_foreign_keys[i]]
-                == through_node.model.c[right_foreign_keys[i]]
+                == through.model.c[right_foreign_keys[i]]
             )
 
         if node._filters:
@@ -525,7 +680,7 @@ class QueryBuilder(object):
         if node.table == node.parent.table:
             op = sa.or_
 
-        from_obj = through_node.model.join(
+        from_obj = through.model.join(
             outer_subquery,
             onclause=op(*onclause),
             isouter=self.isouter,
@@ -536,10 +691,7 @@ class QueryBuilder(object):
             node._subquery = node._subquery.where(sa.and_(*node._filters))
 
         node._subquery = node._subquery.group_by(
-            *[
-                through_node.model.c[column]
-                for column in foreign_keys[through_node.name]
-            ]
+            *[through.model.c[column] for column in foreign_keys[through.name]]
         )
 
         if self.verbose:
@@ -612,7 +764,7 @@ class QueryBuilder(object):
                 isouter=isouter,
             )
 
-        foreign_keys: dict = get_foreign_keys(node.parent, node)
+        foreign_keys: dict = self.get_foreign_keys(node.parent, node)
 
         foreign_key_columns = self._get_column_foreign_keys(
             node.model.columns,
@@ -706,18 +858,29 @@ class QueryBuilder(object):
         if not node.is_root:
             node._subquery = node._subquery.lateral()
 
-    def build_queries(self, node: Node) -> None:
+    def build_queries(
+        self,
+        node: Node,
+        filters: Optional[dict] = None,
+        txmin: Optional[int] = None,
+        txmax: Optional[int] = None,
+        ctid: Optional[dict] = None,
+    ) -> None:
         """Build node query."""
         self.from_obj = None
+        if filters is not None:
+            _filters = self._build_filters(filters, node)
+            if _filters is not None:
+                node._filters.append(_filters)
 
         # 1) add all child columns from one level below
         self._children(node)
 
         if node.is_root:
-            self._root(node)
+            self._root(node, txmin=txmin, txmax=txmax, ctid=ctid)
         else:
             # 2) subquery: these are for children creating their own columns
-            if node.relationship.through_nodes:
+            if node.relationship.throughs:
                 self._through(node)
             else:
                 self._non_through(node)

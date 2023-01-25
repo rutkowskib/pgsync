@@ -61,10 +61,8 @@ class Relationship:
         self.relationship: dict = self.relationship or dict()
         self.type: str = self.relationship.get("type")
         self.variant: str = self.relationship.get("variant")
-        self.through_tables: List[str] = self.relationship.get(
-            "through_tables", []
-        )
-        self.through_nodes: List[Node] = []
+        self.tables: List[str] = self.relationship.get("through_tables", [])
+        self.throughs: List[Node] = []
 
         if not set(self.relationship.keys()).issubset(
             set(RELATIONSHIP_ATTRIBUTES)
@@ -83,9 +81,9 @@ class Relationship:
             raise RelationshipVariantError(
                 f'Relationship variant "{self.variant}" is invalid.'
             )
-        if len(self.through_tables) > 1:
+        if len(self.tables) > 1:
             raise MultipleThroughTablesError(
-                f"Multiple through tables: {self.through_tables}"
+                f"Multiple through tables: {self.tables}"
             )
         if self.type:
             self.type = self.type.lower()
@@ -96,9 +94,7 @@ class Relationship:
         )
 
     def __str__(self):
-        return (
-            f"relationship: {self.variant}.{self.type}:{self.through_tables}"
-        )
+        return f"relationship: {self.variant}.{self.type}:{self.tables}"
 
 
 @dataclass
@@ -135,15 +131,15 @@ class Node(object):
         if self.label is None:
             self.label = self.table
 
-        self.prepare_columns()
+        self.setup()
 
         self.relationship: Relationship = Relationship(self.relationship)
         self._subquery = None
         self._filters: list = []
         self._mapping: dict = {}
 
-        for through_table in self.relationship.through_tables:
-            self.relationship.through_nodes.append(
+        for through_table in self.relationship.tables:
+            self.relationship.throughs.append(
                 Node(
                     models=self.models,
                     table=through_table,
@@ -156,7 +152,13 @@ class Node(object):
     def __str__(self):
         return f"Node: {self.schema}.{self.label}"
 
-    def prepare_columns(self):
+    def __repr__(self):
+        return self.__str__()
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def setup(self):
 
         self.columns = []
 
@@ -261,6 +263,7 @@ class Tree:
     def __post_init__(self):
         self.tables: Set[str] = set()
         self.__nodes: Dict[Node] = {}
+        self.root: Optional[Node] = None
 
     def build(self, data: dict) -> Node:
 
@@ -275,7 +278,7 @@ class Tree:
             attrs = set(data.keys()).difference(set(NODE_ATTRIBUTES))
             raise NodeAttributeError(f"Unknown node attribute(s): {attrs}")
 
-        node = Node(
+        node: Node = Node(
             models=self.models,
             table=table,
             schema=schema,
@@ -286,10 +289,12 @@ class Tree:
             relationship=data.get("relationship", {}),
             base_tables=data.get("base_tables", []),
         )
+        if self.root is None:
+            self.root = node
 
         self.tables.add(node.table)
-        for through_node in node.relationship.through_nodes:
-            self.tables.add(through_node.table)
+        for through in node.relationship.throughs:
+            self.tables.add(through.table)
 
         for child in data.get("children", []):
             node.add_child(self.build(child))
@@ -297,21 +302,18 @@ class Tree:
         self.__nodes[key] = node
         return node
 
-    def get_node(self, root: Node, table: str, schema: str) -> Node:
+    def get_node(self, table: str, schema: str) -> Node:
         """Get node by name."""
         key: Tuple[str, str] = (schema, table)
         if key not in self.__nodes:
-            for node in root.traverse_post_order():
+            for node in self.root.traverse_post_order():
                 if table == node.table and schema == node.schema:
                     self.__nodes[key] = node
                     return self.__nodes[key]
                 else:
-                    for through_node in node.relationship.through_nodes:
-                        if (
-                            table == through_node.table
-                            and schema == through_node.schema
-                        ):
-                            self.__nodes[key] = through_node
+                    for through in node.relationship.throughs:
+                        if table == through.table and schema == through.schema:
+                            self.__nodes[key] = through
                             return self.__nodes[key]
             else:
                 raise RuntimeError(f"Node for {schema}.{table} not found")
